@@ -11,7 +11,7 @@ This application is a Python-based web API designed to procedurally generate 3D 
 Since the application is fully containerized, you do not need to install Blender or Python locally. Ensure you have **Docker** and **Docker Compose** installed on your system (e.g., Debian, Ubuntu, or your preferred Linux distribution).
 
 1. **Clone the repository:**
-   ```bash
+```bash
    git clone [https://github.com/Yvonta/body-factory.git](https://github.com/Yvonta/body-factory.git)
    cd body-factory
 
