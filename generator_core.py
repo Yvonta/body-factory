@@ -727,113 +727,6 @@ def _sanity_check_and_correct_scale(clothes, human):
         print(f"[INFO] Clothes/human bounding-box ratio {ratio:.2f} looks "
               f"reasonable -- no scale correction applied.")
 
-
-def _fit_mhclo_asset_to_human(mpfb_module, human, asset_name, asset_subdir="clothes", asset_label="clothes"):
-    """Load and fit an MPFB2 .mhclo asset (clothing OR hair -- both use the
-    exact same proxy-mesh mechanism in MakeHuman/MPFB2) onto `human`,
-    binding it to the same armature `human` is already rigged with (via
-    add_builtin_rig in generate_mpfb_human()).
-
-    GENERALIZED from _fit_clothes_to_human() (2026-07-30): confirmed via
-    real directory listing that the user's hair assets use the identical
-    .mhclo + .obj + .mhmat format and the same third-party asset-pack
-    naming conventions as the clothing assets -- not MPFB2's separate
-    built-in hair-curves/cards system (a different investigation path
-    that turned out not to apply here). asset_subdir/asset_label let the
-    same logic serve both "clothes" and "hair" (or any other .mhclo asset
-    category AssetService knows about) without duplicating this.
-
-    CONFIRMED (real source read, 2026-07-27, from both assetservice.py AND
-    the actual MPFB2 UI operator that does this in the Blender interface --
-    ui/apply_assets/loadclothes/operators/loadclothes.py). The real
-    sequence is NOT a single fit call -- it's: parse the .mhclo file into
-    an Mhclo entity, import the mesh it references (giving you the actual
-    clothes Object fit_clothes_to_human needs -- passing a bare file path
-    there is what caused the earlier "not an instance of Object" error),
-    THEN fit, THEN separately bind it to the skeleton via set_up_rigging
-    (fit_clothes_to_human only matches shape/position, it does not itself
-    copy bone weights -- set_up_rigging is what makes the garment actually
-    deform with the body's animation).
-    """
-    AssetService = importlib.import_module(f"{mpfb_module}.services.assetservice").AssetService
-
-    # AssetService.find_asset_absolute_path(asset_path_fragment, asset_subdir="clothes")
-    # does an EXACT FILENAME match against files on disk (`if filename in files`) --
-    # it does NOT append an extension for you.
-    mhclo_filename = f"{asset_name}.mhclo"
-    asset_path = None
-    try:
-        asset_path = AssetService.find_asset_absolute_path(mhclo_filename, asset_subdir)
-        if asset_path:
-            print(f"[INFO] Resolved {asset_label} asset '{asset_name}' -> "
-                  f"{asset_path} (via AssetService.find_asset_absolute_path)")
-    except Exception as e:
-        print(f"[WARNING] AssetService.find_asset_absolute_path('{mhclo_filename}', "
-              f"'{asset_subdir}') failed: {e}")
-
-    if not asset_path:
-        print(f"[ERROR] Could not resolve a file path for {asset_label} asset "
-              f"'{asset_name}' (looked for filename '{mhclo_filename}' "
-              f"under the '{asset_subdir}' asset subdir).")
-        return None
-
-    Mhclo = importlib.import_module(f"{mpfb_module}.entities.clothes.mhclo").Mhclo
-    ClothesService = importlib.import_module(f"{mpfb_module}.services.clothesservice").ClothesService
-
-    # --- Step 1: parse the .mhclo file and import the mesh it references.
-    # THIS is the real asset Object -- not the file path itself. ---
-    try:
-        mhclo = Mhclo()
-        mhclo.load(asset_path)
-        asset_obj = mhclo.load_mesh(bpy.context)
-    except Exception as e:
-        print(f"[ERROR] Mhclo().load('{asset_path}') / load_mesh() failed: {e}")
-        return None
-
-    if not asset_obj:
-        print(f"[ERROR] mhclo.load_mesh() returned no object for "
-              f"'{asset_path}' -- failed to import the {asset_label} mesh.")
-        return None
-    print(f"[INFO] Imported {asset_label} mesh object '{asset_obj.name}' from "
-          f"'{asset_path}'.")
-
-    # --- Step 1.5: build a REAL textured material, matching the actual
-    # MPFB2 load-clothes operator's MAKESKIN branch (confirmed via direct
-    # source inspection, 2026-07-29). Without this, mhclo.load_mesh()
-    # leaves whatever bare/default material the raw .obj import produced,
-    # which is why clothing textures weren't showing at all before this. ---
-    if mhclo.material:
-        try:
-            MaterialService = importlib.import_module(f"{mpfb_module}.services.materialservice").MaterialService
-            MakeSkinMaterial = importlib.import_module(f"{mpfb_module}.entities.material.makeskinmaterial").MakeSkinMaterial
-            makeskin_material = MakeSkinMaterial()
-            makeskin_material.populate_from_mhmat(mhclo.material)
-            mat_name = os.path.basename(mhclo.material)
-            blender_material = MaterialService.create_empty_material(mat_name, asset_obj)
-            makeskin_material.apply_node_tree(blender_material)
-            print(f"[INFO] Built real textured material '{mat_name}' for "
-                  f"'{asset_obj.name}' via MakeSkinMaterial.populate_from_mhmat() "
-                  f"+ apply_node_tree() (from mhclo.material='{mhclo.material}').")
-        except Exception as e:
-            print(f"[WARNING] Building the real MakeSkin material failed "
-                  f"(continuing with whatever material load_mesh() left in "
-                  f"place -- likely untextured): {e}")
-    else:
-        print(f"[WARNING] mhclo.material is empty for '{asset_obj.name}' -- "
-              f"this .mhclo doesn't reference a .mhmat material file, so "
-              f"there's no texture to build regardless of the code above.")
-
-    # --- Step 2: fit it to this specific human's shape (position/scale to
-    # match the body's macrodetail values -- NOT bone weights yet). ---
-    try:
-        ClothesService.fit_clothes_to_human(asset_obj, human, mhclo)
-        mhclo.set_scalings(bpy.context, human)
-        print(f"[INFO] Fitted '{asset_obj.name}' to human via "
-              f"ClothesService.fit_clothes_to_human() + mhclo.set_scalings().")
-    except Exception as e:
-        print(f"[WARNING] Fitting step failed (continuing anyway -- "
-              f"{asset_label} may be mispositioned): {e}")
-
 def _sanity_check_and_correct_hair(hair_obj, human):
     """Hair-specific sanity check: compare against the HUMAN'S HEAD size
     (estimated as a fraction of total body height -- see CHANGED note
@@ -973,6 +866,115 @@ def _sanity_check_and_correct_hair(hair_obj, human):
         asset_obj.parent = human
 
     return asset_obj
+
+
+
+
+def _fit_mhclo_asset_to_human(mpfb_module, human, asset_name, asset_subdir="clothes", asset_label="clothes"):
+    """Load and fit an MPFB2 .mhclo asset (clothing OR hair -- both use the
+    exact same proxy-mesh mechanism in MakeHuman/MPFB2) onto `human`,
+    binding it to the same armature `human` is already rigged with (via
+    add_builtin_rig in generate_mpfb_human()).
+
+    GENERALIZED from _fit_clothes_to_human() (2026-07-30): confirmed via
+    real directory listing that the user's hair assets use the identical
+    .mhclo + .obj + .mhmat format and the same third-party asset-pack
+    naming conventions as the clothing assets -- not MPFB2's separate
+    built-in hair-curves/cards system (a different investigation path
+    that turned out not to apply here). asset_subdir/asset_label let the
+    same logic serve both "clothes" and "hair" (or any other .mhclo asset
+    category AssetService knows about) without duplicating this.
+
+    CONFIRMED (real source read, 2026-07-27, from both assetservice.py AND
+    the actual MPFB2 UI operator that does this in the Blender interface --
+    ui/apply_assets/loadclothes/operators/loadclothes.py). The real
+    sequence is NOT a single fit call -- it's: parse the .mhclo file into
+    an Mhclo entity, import the mesh it references (giving you the actual
+    clothes Object fit_clothes_to_human needs -- passing a bare file path
+    there is what caused the earlier "not an instance of Object" error),
+    THEN fit, THEN separately bind it to the skeleton via set_up_rigging
+    (fit_clothes_to_human only matches shape/position, it does not itself
+    copy bone weights -- set_up_rigging is what makes the garment actually
+    deform with the body's animation).
+    """
+    AssetService = importlib.import_module(f"{mpfb_module}.services.assetservice").AssetService
+
+    # AssetService.find_asset_absolute_path(asset_path_fragment, asset_subdir="clothes")
+    # does an EXACT FILENAME match against files on disk (`if filename in files`) --
+    # it does NOT append an extension for you.
+    mhclo_filename = f"{asset_name}.mhclo"
+    asset_path = None
+    try:
+        asset_path = AssetService.find_asset_absolute_path(mhclo_filename, asset_subdir)
+        if asset_path:
+            print(f"[INFO] Resolved {asset_label} asset '{asset_name}' -> "
+                  f"{asset_path} (via AssetService.find_asset_absolute_path)")
+    except Exception as e:
+        print(f"[WARNING] AssetService.find_asset_absolute_path('{mhclo_filename}', "
+              f"'{asset_subdir}') failed: {e}")
+
+    if not asset_path:
+        print(f"[ERROR] Could not resolve a file path for {asset_label} asset "
+              f"'{asset_name}' (looked for filename '{mhclo_filename}' "
+              f"under the '{asset_subdir}' asset subdir).")
+        return None
+
+    Mhclo = importlib.import_module(f"{mpfb_module}.entities.clothes.mhclo").Mhclo
+    ClothesService = importlib.import_module(f"{mpfb_module}.services.clothesservice").ClothesService
+
+    # --- Step 1: parse the .mhclo file and import the mesh it references.
+    # THIS is the real asset Object -- not the file path itself. ---
+    try:
+        mhclo = Mhclo()
+        mhclo.load(asset_path)
+        asset_obj = mhclo.load_mesh(bpy.context)
+    except Exception as e:
+        print(f"[ERROR] Mhclo().load('{asset_path}') / load_mesh() failed: {e}")
+        return None
+
+    if not asset_obj:
+        print(f"[ERROR] mhclo.load_mesh() returned no object for "
+              f"'{asset_path}' -- failed to import the {asset_label} mesh.")
+        return None
+    print(f"[INFO] Imported {asset_label} mesh object '{asset_obj.name}' from "
+          f"'{asset_path}'.")
+
+    # --- Step 1.5: build a REAL textured material, matching the actual
+    # MPFB2 load-clothes operator's MAKESKIN branch (confirmed via direct
+    # source inspection, 2026-07-29). Without this, mhclo.load_mesh()
+    # leaves whatever bare/default material the raw .obj import produced,
+    # which is why clothing textures weren't showing at all before this. ---
+    if mhclo.material:
+        try:
+            MaterialService = importlib.import_module(f"{mpfb_module}.services.materialservice").MaterialService
+            MakeSkinMaterial = importlib.import_module(f"{mpfb_module}.entities.material.makeskinmaterial").MakeSkinMaterial
+            makeskin_material = MakeSkinMaterial()
+            makeskin_material.populate_from_mhmat(mhclo.material)
+            mat_name = os.path.basename(mhclo.material)
+            blender_material = MaterialService.create_empty_material(mat_name, asset_obj)
+            makeskin_material.apply_node_tree(blender_material)
+            print(f"[INFO] Built real textured material '{mat_name}' for "
+                  f"'{asset_obj.name}' via MakeSkinMaterial.populate_from_mhmat() "
+                  f"+ apply_node_tree() (from mhclo.material='{mhclo.material}').")
+        except Exception as e:
+            print(f"[WARNING] Building the real MakeSkin material failed "
+                  f"(continuing with whatever material load_mesh() left in "
+                  f"place -- likely untextured): {e}")
+    else:
+        print(f"[WARNING] mhclo.material is empty for '{asset_obj.name}' -- "
+              f"this .mhclo doesn't reference a .mhmat material file, so "
+              f"there's no texture to build regardless of the code above.")
+
+    # --- Step 2: fit it to this specific human's shape (position/scale to
+    # match the body's macrodetail values -- NOT bone weights yet). ---
+    try:
+        ClothesService.fit_clothes_to_human(asset_obj, human, mhclo)
+        mhclo.set_scalings(bpy.context, human)
+        print(f"[INFO] Fitted '{asset_obj.name}' to human via "
+              f"ClothesService.fit_clothes_to_human() + mhclo.set_scalings().")
+    except Exception as e:
+        print(f"[WARNING] Fitting step failed (continuing anyway -- "
+              f"{asset_label} may be mispositioned): {e}")
 
 
 def _fit_clothes_to_human(mpfb_module, human, clothes_name):
