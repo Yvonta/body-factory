@@ -1769,6 +1769,55 @@ def project_face_texture(human, input_image_path, landmarks_path=None,
                           face_scale_margin=0.75, skin_tone_adjust=0,
                           debug_mask=False, output_path=None):
     mesh = human.data
+
+    # CHANGED (explicit request): stop projecting the photo onto the head
+    # as a texture entirely. Keep using the photo for skin COLOR (same
+    # sampling as before -- forehead + both cheeks, well away from eyes/
+    # mouth/hair) and nothing else here -- head SHAPE (deform_head_from_
+    # landmarks, controlled separately by --skip-head-warp) is unaffected
+    # by this change, per instruction to leave everything else as-is.
+    #
+    # This short-circuits at the very top, before any of the camera/UV-
+    # projection/material-split setup below ever runs, rather than
+    # partway through -- that setup creates real Blender objects (a
+    # camera, UV layers, a multi-node material graph) that would need
+    # careful cleanup if abandoned mid-way; skipping it entirely avoids
+    # that risk rather than trying to selectively unwind it.
+    sampled_tone = _sample_skin_tone_from_photo(input_image_path, landmarks_path)
+    if sampled_tone:
+        base_tone = sampled_tone
+        print(f"[INFO] Sampled skin tone from photo (forehead + both "
+              f"cheeks): RGB={tuple(round(c, 3) for c in sampled_tone)}")
+    else:
+        base_tone = (0.76, 0.57, 0.47)
+        print(f"[INFO] Using default flat skin tone (photo sampling "
+              f"unavailable): RGB={base_tone}")
+
+    adjusted_tone = _apply_skin_tone_adjust(base_tone, skin_tone_adjust)
+    if skin_tone_adjust:
+        print(f"[INFO] Applied skin_tone_adjust={skin_tone_adjust:+d} "
+              f"step(s): RGB {tuple(round(c, 3) for c in base_tone)} -> "
+              f"{tuple(round(c, 3) for c in adjusted_tone)}")
+    skin_tone = (*adjusted_tone, 1.0)
+
+    flat_mat = bpy.data.materials.new(name="SkinMaterial")
+    flat_mat.use_nodes = True
+    flat_bsdf = flat_mat.node_tree.nodes.get("Principled BSDF")
+    if flat_bsdf:
+        flat_bsdf.inputs["Base Color"].default_value = skin_tone
+
+    mesh.materials.clear()
+    mesh.materials.append(flat_mat)
+    for poly in mesh.polygons:
+        poly.material_index = 0
+
+    print(f"[INFO] Face/head texture projection skipped (photo used only "
+          f"for skin color, not as a texture) -- applied flat skin tone "
+          f"RGB={tuple(round(c, 3) for c in adjusted_tone)} to the whole "
+          f"mesh, {len(mesh.polygons)} polygons.")
+
+    return flat_mat, skin_tone
+
     # FIX: previously used a fixed head_fraction with no minimum-vertex-count
     # safeguard (only an empty-set fallback), which starves the head/face
     # selection on lower-poly donor meshes -- a very plausible cause of the
@@ -2745,8 +2794,13 @@ def main():
         output_path=args["output"],
     )
 
-    png_path = os.path.splitext(args["output"])[0] + "_texture.png"
-    bake_face_texture(human, face_mat, skin_tone, png_path)
+    # CHANGED: project_face_texture() now returns an already-finished flat
+    # material (skin color from the photo, no projected texture) -- no
+    # baking step needed or possible (there's no camera-projected UV
+    # layout for bake_face_texture() to read from anymore). Left the
+    # function itself defined/unchanged below in case this gets reverted.
+    print("[INFO] Skipping bake_face_texture() -- face material is already "
+          "a finished flat color, not a projected photo texture.")
 
     # FIX: export_apply=True ("Apply Modifiers") was fine when there were
     # no shape keys or armature to worry about, but it's documented to
