@@ -9,6 +9,7 @@
 # (Re)building and running the docker conainer for the Yvonta's Body Factory web API
 # 
 mkdir -p ./mpfb-assets/clothes/
+mkdir -p ./mpfb-assets/hair/
 docker stop avatar-service
 docker rm avatar-service
 # CHANGED: --build-arg CACHEBUST=$(date +%s) gives the Dockerfile's
