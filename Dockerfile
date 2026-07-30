@@ -102,6 +102,7 @@ COPY remove_background.py ./
 # without paying the cost of redoing everything above it (which
 # --no-cache would do wholesale, and was confirmed to take "ages").
 ARG CACHEBUST=1
+RUN echo "$CACHEBUST" > /dev/null
 COPY server.py generator_core.py ./
 
 # Bake the CC0 clothing asset packs into the image at build time 
