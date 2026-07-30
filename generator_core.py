@@ -1,15 +1,3 @@
-"""
-Yvonta's Body Factory 
----------------------
-Author...: Dirk Jan Buter (Yvonta)
-Email....: hello@yvonta.com
-Date.....: 29-07-2026
-Licence..: CC0 1.0 Universal
-
-Genarates an avatar based on the userinput by using blender headless for the local web api.
-
-"""
-
 import bpy
 import sys
 import os
@@ -509,7 +497,7 @@ def _configure_mpfb_asset_root(mpfb_module):
 
 
 def generate_mpfb_human(gender_value, age, weight, standard_rig="cmu_mb",
-                         viseme_pack="visemes02"):
+                         viseme_pack="visemes02", remove_hair_genitals=True):
     """Generate a rigged, viseme-ready human LIVE via MPFB2, replacing the
     static-donor-mesh append_donor_body() path. Used when --mpfb-live is
     set. Every call in here is copied from mpfb_setup_donor.py's
@@ -606,10 +594,31 @@ def generate_mpfb_human(gender_value, age, weight, standard_rig="cmu_mb",
     # something else), not by create_human() itself. Running this check
     # here instead, after every other setup step, gives it an actual
     # chance of finding what it's looking for.
-    print("[INFO] Checking for clothing/hair to remove (moved to run after "
-          "rig/macro/viseme setup, since they weren't present immediately "
-          "after create_human()).")
-    basemesh = _remove_clothes_and_hair(mpfb_module, basemesh)
+    # NEW: skippable for the clothing-fit reference body (see
+    # remove_hair_genitals param). Real diagnosis (2026-07-30): our own
+    # hair/genital vertex removal changes this mesh's vertex COUNT --
+    # confirmed our post-removal count is exactly 14136, and
+    # ClothesService.set_up_rigging() failed with "index 17150 out of
+    # range, size 14136" -- its internal weight-transfer looks up
+    # vertices by INDEX against the topology .mhclo calibration data
+    # expects, which needs MORE vertices than our reduced mesh has (very
+    # likely the pristine, unmodified MakeHuman basemesh vertex count).
+    # The clothing-fit reference body is NEVER itself exported (only the
+    # garment + armature are), so there's no visual reason to strip
+    # hair/genitals from it at all -- keeping the pristine vertex
+    # topology there should let real rigging succeed instead of falling
+    # back to unskinned (which we've now confirmed positions garments
+    # essentially at random, sometimes far above/below the body).
+    if remove_hair_genitals:
+        print("[INFO] Checking for clothing/hair to remove (moved to run after "
+              "rig/macro/viseme setup, since they weren't present immediately "
+              "after create_human()).")
+        basemesh = _remove_clothes_and_hair(mpfb_module, basemesh)
+    else:
+        print("[INFO] Skipping hair/genital removal -- keeping the pristine "
+              "vertex topology (needed for clothing rig weight-transfer to "
+              "find the vertex indices it expects; this body is only used "
+              "as a rigging reference here, never exported itself).")
 
     basemesh.name = "Human"
     basemesh.data.name = "Human"
@@ -669,7 +678,26 @@ def _sanity_check_and_correct_scale(clothes, human):
               f"-- this asset's .mhclo is likely missing proper scale "
               f"calibration. Applying corrective uniform scale ×{correction:.3f} "
               f"as a fallback (not a substitute for fixing the source asset).")
-        clothes.scale = tuple(s * correction for s in clothes.scale)
+        # FIX: scale the mesh's VERTEX DATA directly, around the garment's
+        # own local bounding-box center -- NOT via the object's .scale
+        # property. Object-level scaling happens around whatever the
+        # object's origin point is (often not the garment's own visual
+        # center for third-party assets), which shifts the mesh's
+        # apparent position as a side effect of "correcting" its size.
+        # Confirmed via a real exported GLB: the garment came out
+        # correctly proportioned but floating well below the body,
+        # because this mesh isn't skinned (rigging failed for it, see
+        # the warning below) and gets exported as a static parented mesh
+        # carrying its raw object-level scale as a glTF node transform.
+        # Scaling vertex data around the mesh's own bbox center fixes
+        # the size without touching position at all, and avoids leaving
+        # any non-identity node transform in the export.
+        local_corners = [Vector(c) for c in clothes.bound_box]
+        center = sum(local_corners, Vector((0.0, 0.0, 0.0))) / len(local_corners)
+        mesh_data = clothes.data
+        for v in mesh_data.vertices:
+            v.co = center + (v.co - center) * correction
+        mesh_data.update()
         bpy.context.view_layer.update()
     else:
         print(f"[INFO] Clothes/human bounding-box ratio {ratio:.2f} looks "
@@ -818,7 +846,8 @@ def run_clothing_fit(args):
     print(f"[INFO] --clothing-fit '{args['clothing_fit']}': building body "
           f"(gender={args['gender_value']:.3f}, age={args['age']:.2f}, "
           f"weight={args['weight']:.2f}) to fit clothing against...")
-    human = generate_mpfb_human(args["gender_value"], args["age"], args["weight"])
+    human = generate_mpfb_human(args["gender_value"], args["age"], args["weight"],
+                                 remove_hair_genitals=False)
 
     mpfb_module = _find_mpfb_module_name()
     _configure_mpfb_asset_root(mpfb_module)
@@ -1328,6 +1357,8 @@ def measure_photo_face_features(landmarks_path):
         face_width_px = 1.0
 
     nose_x_frac = lm[LM_NOSE_TIP]["x"]
+    eye_center_x_frac = (lm[LM_LEFT_EYE_OUTER]["x"] + lm[LM_RIGHT_EYE_OUTER]["x"]) / 2.0
+    eye_dist_px = _dist_px(lm, LM_LEFT_EYE_OUTER, LM_RIGHT_EYE_OUTER, w, h)
 
     return {
         "eye_line_frac": eye_line_frac,
@@ -1340,6 +1371,8 @@ def measure_photo_face_features(landmarks_path):
         "face_frac_of_image_h": face_height_px / h if h else 0.5,
         "face_frac_of_image_w": face_width_px / w if w else 0.5,
         "nose_x_frac": nose_x_frac,
+        "eye_center_x_frac": eye_center_x_frac,
+        "eye_dist_px": eye_dist_px,
     }
 
 
@@ -1744,6 +1777,16 @@ def project_face_texture(human, input_image_path, landmarks_path=None,
     # measure_mesh_ratios() via select_head_vertices(), which adaptively
     # grows the slice until it has enough vertices.
     head_verts, head_threshold, z_max = select_head_vertices(mesh, head_fraction)
+    # FIX: cache indices as plain ints RIGHT NOW, not later -- a real test
+    # showed 0 in-head polygons detected far below despite head_verts
+    # genuinely having 4919 entries, even though head_vert_indices itself
+    # reported the correct count. Between here and where that set gets
+    # rebuilt (much later, after shape-key baking and other mesh-modifying
+    # operations), the MeshVertex object references in head_verts can go
+    # stale -- classic Blender scripting trap. Integer indices captured
+    # immediately, before anything touches the mesh, stay valid as long as
+    # vertex count/order doesn't change (which none of the later steps do).
+    head_vert_indices_stable = {v.index for v in head_verts}
 
     xs = [v.co.x for v in head_verts]
     ys = [v.co.y for v in head_verts]
@@ -1765,52 +1808,76 @@ def project_face_texture(human, input_image_path, landmarks_path=None,
 
     use_ortho = feat is not None
 
-    # NEW: instead of assuming a generic anatomical percentage for where
-    # eyes "should" sit (the previous head_height x face_scale_margin
-    # heuristic), measure THIS mesh's own actual eye height directly from
-    # its 'helper-l-eye'/'helper-r-eye' vertex groups (confirmed real
-    # group names on this mesh from prior vertex-group listings) and
-    # calibrate the whole face-zone scale against that real, verifiable
-    # value. Real user feedback (eyes AND mustache both landing too high,
-    # by a similar-looking amount) pointed at a uniform scale-calibration
-    # error rather than an asymmetric stretch problem -- this replaces
-    # the guessed constant with a measured one.
+    # NEW: instead of calibrating from a single eye measurement, measure
+    # THIS mesh's own actual eye AND mouth positions (real vertex groups:
+    # 'helper-l-eye'/'helper-r-eye', 'lips') and fit a least-squares line
+    # through every available real anchor point (eye, mouth, chin) rather
+    # than solving exactly from just one pair. More real points average
+    # out any single measurement's noise -- this is the multi-landmark
+    # alignment the person explicitly asked for.
+    #
+    # Ears are deliberately NOT included: MediaPipe's face landmark model
+    # is a frontal-face model and does not reliably track ear position
+    # (ears sit at/outside the edge of the tracked region), so there's no
+    # trustworthy photo-side ear landmark to anchor against. Eyes serve as
+    # the standard, more reliable substitute for horizontal alignment
+    # further below.
+    def _measure_vertex_group_avg(obj, mesh_data, group_names):
+        """Average (x, y, z) of every vertex weighted into any of the
+        named vertex groups on obj, or None if none found/weighted."""
+        groups = [vg for vg in obj.vertex_groups if vg.name in group_names]
+        if not groups:
+            return None
+        group_indices = {vg.index for vg in groups}
+        xs, ys, zs = [], [], []
+        for v in mesh_data.vertices:
+            for g in v.groups:
+                if g.group in group_indices and g.weight > 0.01:
+                    xs.append(v.co.x); ys.append(v.co.y); zs.append(v.co.z)
+                    break
+        if not xs:
+            return None
+        n = len(xs)
+        return (sum(xs) / n, sum(ys) / n, sum(zs) / n)
+
+    real_eye = None
+    real_mouth = None
     calibrated_face_scale_world = None
     if use_ortho:
-        eye_groups = [vg for vg in human.vertex_groups
-                      if vg.name in ("helper-l-eye", "helper-r-eye")]
-        if eye_groups:
-            group_indices = {vg.index for vg in eye_groups}
-            eye_zs = []
-            for v in mesh.vertices:
-                for g in v.groups:
-                    if g.group in group_indices and g.weight > 0.01:
-                        eye_zs.append(v.co.z)
-                        break
-            if eye_zs and feat["eye_line_frac"] < 1.0:
-                real_eye_z = sum(eye_zs) / len(eye_zs)
-                # Solve for the scale that makes the photo's eye_line_frac
-                # map EXACTLY onto this mesh's own real measured eye
-                # height, anchored on two real points (chin_z, real_eye_z)
-                # instead of an assumed percentage.
-                calibrated_face_scale_world = (real_eye_z - chin_z) / (1.0 - feat["eye_line_frac"])
-                heuristic_scale = head_height * face_scale_margin
-                print(f"[INFO] Real mesh eye height measured at Z={real_eye_z:.4f} "
-                      f"(avg of {len(eye_zs)} verts in 'helper-l-eye'/"
-                      f"'helper-r-eye') -- calibrated face-zone scale="
-                      f"{calibrated_face_scale_world:.4f} (heuristic "
-                      f"head_height x face_scale_margin would have been "
-                      f"{heuristic_scale:.4f}). Using the calibrated value "
-                      f"for both aim and camera scale below.")
-            else:
-                print("[WARNING] Found eye vertex groups but no weighted "
-                      "vertices in them -- falling back to the "
-                      "head_height x face_scale_margin heuristic.")
+        real_eye = _measure_vertex_group_avg(human, mesh, ("helper-l-eye", "helper-r-eye"))
+        real_mouth = _measure_vertex_group_avg(human, mesh, ("lips",))
+
+        pairs = [(1.0, chin_z)]  # chin landmark (frac=1) anchors at the directly-measured neck-boundary Z
+        if real_eye is not None and feat["eye_line_frac"] < 1.0:
+            pairs.append((feat["eye_line_frac"], real_eye[2]))
         else:
-            print("[WARNING] No 'helper-l-eye'/'helper-r-eye' vertex groups "
-                  "found on this mesh -- falling back to the head_height x "
-                  "face_scale_margin heuristic. Check real vertex group "
-                  "names if this mesh's naming differs.")
+            print("[WARNING] 'helper-l-eye'/'helper-r-eye' vertex groups not "
+                  "found/weighted on this mesh -- eye anchor unavailable for "
+                  "vertical calibration.")
+        if real_mouth is not None and feat["mouth_line_frac"] < 1.0:
+            pairs.append((feat["mouth_line_frac"], real_mouth[2]))
+        else:
+            print("[WARNING] 'lips' vertex group not found/weighted on this "
+                  "mesh -- mouth anchor unavailable for vertical calibration.")
+
+        if len(pairs) >= 2:
+            import numpy as np
+            fracs = np.array([p[0] for p in pairs])
+            zs = np.array([p[1] for p in pairs])
+            slope, intercept = np.polyfit(fracs, zs, 1)
+            calibrated_face_scale_world = -float(slope)
+            heuristic_scale = head_height * face_scale_margin
+            print(f"[INFO] Multi-point vertical calibration using "
+                  f"{len(pairs)} real anchor(s): fitted mesh_z = "
+                  f"{intercept:.4f} + {slope:.4f}*frac (least-squares over "
+                  f"{[(round(f, 3), round(z, 4)) for f, z in pairs]}) -> "
+                  f"calibrated face-zone scale={calibrated_face_scale_world:.4f} "
+                  f"(heuristic head_height x face_scale_margin would have "
+                  f"been {heuristic_scale:.4f}).")
+        else:
+            print("[WARNING] Not enough real mesh anchors to calibrate -- "
+                  "falling back to the head_height x face_scale_margin "
+                  "heuristic.")
 
     if use_ortho:
         # FIX: nose_tip_frac is measured as a fraction of the PHOTO's
@@ -1837,7 +1904,7 @@ def project_face_texture(human, input_image_path, landmarks_path=None,
         print(f"[INFO] Auto-detected aim: nose sits at {feat['nose_tip_frac']:.3f} "
               f"of the forehead->chin span in the photo -> mesh Z={face_center_z:.4f} "
               f"(using face-zone height {mesh_face_height_world_for_aim:.4f}, "
-              f"{'calibrated from real eye vertex-group measurement' if calibrated_face_scale_world is not None else f'heuristic: head_height {head_height:.4f} x face_scale_margin {face_scale_margin:.2f}'})")
+              f"{'multi-point calibrated (eye/mouth/chin)' if calibrated_face_scale_world is not None else f'heuristic: head_height {head_height:.4f} x face_scale_margin {face_scale_margin:.2f}'})")
 
         # DIAGNOSTIC (added to investigate "eyes/texture too high" reports):
         # extrapolate where eye_line_frac and mouth_line_frac land in mesh Z
@@ -1902,35 +1969,54 @@ def project_face_texture(human, input_image_path, landmarks_path=None,
         cam.data.ortho_scale = frame_height_world
         print(f"[INFO] Orthographic camera scale = {frame_height_world:.4f} "
               f"world units (face-zone height {mesh_face_height_world:.4f} "
-              f"[{'calibrated from real eye measurement' if calibrated_face_scale_world is not None else 'heuristic'}], "
+              f"[{'multi-point calibrated' if calibrated_face_scale_world is not None else 'heuristic'}], "
               f"divided by measured face_frac_of_image={face_frac_of_image:.3f})")
 
         aspect = (img_w / img_h) if (img_w and img_h) else 1.0
-        frame_width_world = frame_height_world * aspect
-        nose_offset_frac = feat["nose_x_frac"] - 0.5
 
-        # FIX (round 2): the first version used scale=0.63, estimated from
-        # a single data point (assuming the code's own uncorrected-
-        # baseline logic was exact). A second real measurement confirmed
-        # the approach is right but let me solve this properly with two
-        # real points instead of one assumption:
-        #   camera_shift=-0.0199 (scale=1.0, i.e. uncorrected) -> landed
-        #     at mesh X=-0.0114
-        #   camera_shift=-0.01254 (scale=0.63) -> landed at mesh X=-0.0048
-        # Solving the linear relationship between shift and landing
-        # position for where landing=0: scale* = 0.0072 / 0.0199 = 0.36.
-        # This is now grounded in two real measurements, not one
-        # assumption -- should be close, but verify against a third
-        # measurement and re-derive the same way if it's still off.
-        HORIZONTAL_CORRECTION_SCALE = 0.36
-        world_x_offset = nose_offset_frac * frame_width_world * HORIZONTAL_CORRECTION_SCALE
+        # NEW: calibrate horizontal scale from the mesh's real inter-eye
+        # distance instead of just deriving frame width from the vertical
+        # scale x aspect ratio (which silently assumes the photo and mesh
+        # share identical proportions -- not guaranteed). Also center on
+        # the eye MIDPOINT rather than the nose tip -- eyes are a more
+        # reliable symmetric anchor, since nose position in a photo can
+        # shift with head yaw/rotation even when the face is otherwise
+        # centered.
+        left_eye = _measure_vertex_group_avg(human, mesh, ("helper-l-eye",))
+        right_eye = _measure_vertex_group_avg(human, mesh, ("helper-r-eye",))
+        frame_width_world = frame_height_world * aspect  # fallback default
+        target_mesh_x = 0.0
+        horizontal_calibrated = False
+        if (left_eye is not None and right_eye is not None
+                and feat.get("eye_dist_px", 0) > 1.0 and feat.get("image_width_px", 0) > 0):
+            real_eye_dist_world = abs(right_eye[0] - left_eye[0])
+            photo_eye_dist_frac_of_width = feat["eye_dist_px"] / feat["image_width_px"]
+            if photo_eye_dist_frac_of_width > 0.001 and real_eye_dist_world > 0.0001:
+                frame_width_world = real_eye_dist_world / photo_eye_dist_frac_of_width
+                target_mesh_x = (left_eye[0] + right_eye[0]) / 2.0
+                horizontal_calibrated = True
+                print(f"[INFO] Horizontal calibration from real inter-eye "
+                      f"distance: mesh eye separation={real_eye_dist_world:.4f} "
+                      f"world units, photo eye separation="
+                      f"{photo_eye_dist_frac_of_width:.3f} of image width -> "
+                      f"calibrated frame_width_world={frame_width_world:.4f} "
+                      f"(vs aspect-derived {frame_height_world * aspect:.4f}), "
+                      f"target mesh eye-center X={target_mesh_x:.4f}.")
+        if not horizontal_calibrated:
+            print("[WARNING] Could not calibrate horizontal scale from real "
+                  "eye distance (missing eye vertex groups or degenerate "
+                  "measurement) -- falling back to aspect-ratio-derived "
+                  "width and assuming mesh eye-center X=0.")
+
+        eye_center_x_frac = feat.get("eye_center_x_frac", feat["nose_x_frac"])
+        uncorrected_mesh_x = (eye_center_x_frac - 0.5) * frame_width_world
+        world_x_offset = uncorrected_mesh_x - target_mesh_x
         cam.location.x -= world_x_offset
-        print(f"[INFO] Horizontal aim correction: photo nose sits at "
-              f"x={feat['nose_x_frac']:.3f} of image width (0.5=center) "
-              f"-> camera shifted by {-world_x_offset:.4f} world units "
-              f"(scale={HORIZONTAL_CORRECTION_SCALE}, derived from two "
-              f"real measurements -- re-derive the same way if a third "
-              f"measurement still isn't centered)")
+        print(f"[INFO] Horizontal aim correction: photo eye-midpoint sits "
+              f"at x={eye_center_x_frac:.3f} of image width (0.5=center), "
+              f"target mesh X={target_mesh_x:.4f} "
+              f"({'real measured eye-center' if horizontal_calibrated else 'assumed 0'}) "
+              f"-> camera shifted by {-world_x_offset:.4f} world units.")
     else:
         if img_w and img_h:
             pass
@@ -2050,16 +2136,59 @@ def project_face_texture(human, input_image_path, landmarks_path=None,
     mesh.materials.append(skin_mat)
     mesh.materials.append(face_mat)
 
-    head_vert_indices = {v.index for v in head_verts}
+    head_vert_indices = head_vert_indices_stable
     cam_loc = cam.location
+    print(f"[DIAGNOSTIC] Material-split camera position: cam_loc={tuple(cam_loc)}, "
+          f"head_vert_indices count={len(head_vert_indices)}")
+    in_head_count = 0
+    facing_count = 0
+    sample_printed = 0
+    # WIDENED (requested: texture should reach the ears on both sides):
+    # previously required poly.normal.dot(to_cam) > 0, a strict 90-degree
+    # cutoff -- only polygons facing (roughly) straight at the camera
+    # qualified, which excludes side-facing geometry like ears/temples
+    # entirely (their normals point sideways, not toward an
+    # approximately-centered camera). Using a normalized dot product
+    # against a threshold below zero relaxes this to ~110 degrees from
+    # dead-on, pulling in that side geometry. This doesn't give ears real
+    # photo detail (a front photo genuinely doesn't show them), but it
+    # does widen the region that gets the face material/projected texture
+    # rather than falling back to flat skin right at the cheekbone.
+    # REVERTED (was -0.15, briefly -0.35): confirmed via a real photo with
+    # a colorful background right behind the head that ANY widening past
+    # the original strict cutoff risks projecting background content onto
+    # the model, not just distorted skin. Simple planar/orthographic
+    # projection has no depth information, so it cannot tell "this pixel
+    # is the person's jaw" from "this pixel is the wall behind them" once
+    # the included polygons reach far enough toward the silhouette edge --
+    # this is a real limitation of the projection method itself, not a
+    # tuning problem, so pushing this value further negative again is
+    # very likely to reproduce the same class of bug on some photos even
+    # if it looks fine on others. Reaching all the way to the ears would
+    # need actual photo background segmentation (a much larger feature),
+    # not a threshold tweak. 0.0 = the original strict "must face the
+    # camera at least partially" cutoff, with no deliberate widening.
+    FACE_ANGLE_THRESHOLD = 0.0
     for poly in mesh.polygons:
         in_head = all(vi in head_vert_indices for vi in poly.vertices)
         if in_head:
+            in_head_count += 1
             to_cam = cam_loc - poly.center
-            facing_camera = poly.normal.dot(to_cam) > 0
+            to_cam_dir = to_cam.normalized() if to_cam.length > 0 else to_cam
+            facing_camera = poly.normal.dot(to_cam_dir) > FACE_ANGLE_THRESHOLD
+            if facing_camera:
+                facing_count += 1
+            elif sample_printed < 5:
+                print(f"[DIAGNOSTIC] Sample in-head, NOT-facing polygon: "
+                      f"center={tuple(poly.center)}, normal={tuple(poly.normal)}, "
+                      f"to_cam={tuple(to_cam)}, dot={poly.normal.dot(to_cam_dir):.4f}")
+                sample_printed += 1
         else:
             facing_camera = False
         poly.material_index = 1 if (in_head and facing_camera) else 0
+    print(f"[DIAGNOSTIC] Material split result: {in_head_count} in-head "
+          f"polygons, {facing_count} of those facing camera "
+          f"(material_index=1).")
 
     if len(uv_mod.projectors) > 0:
         uv_mod.projectors[0].object = cam
@@ -2323,13 +2452,25 @@ def bake_face_texture(human, face_mat, skin_tone, output_png_path,
 
     uv_layer = mesh.uv_layers[bake_uv_name]
 
-    def _rescale_material_group_uvs(material_index, target_box, label):
+    def _rescale_material_group_uvs(material_index, target_box, label,
+                                     source_uv_layer=None):
+        # NEW: source_uv_layer lets this read coordinates from a DIFFERENT,
+        # already-coherent UV layer (FaceProjection -- a simple camera
+        # projection, not an organic-mesh unwrap, so it has no seams/
+        # fragmentation at all for front-facing geometry) instead of the
+        # smart_project-generated one on `uv_layer`. Writes always go to
+        # `uv_layer` (BakeUV) regardless of where they're read from --
+        # this replaces smart_project's fragmented face layout wholesale
+        # rather than just repositioning it, which is what was leaving
+        # "76-80% unpainted" (empty inter-island padding, not failed
+        # painting) and isolated-looking features like the lips.
+        read_layer = source_uv_layer if source_uv_layer is not None else uv_layer
         us, vs, loop_refs = [], [], []
         for poly in mesh.polygons:
             if poly.material_index != material_index:
                 continue
             for li in poly.loop_indices:
-                uv = uv_layer.data[li].uv
+                uv = read_layer.data[li].uv
                 us.append(uv.x)
                 vs.append(uv.y)
                 loop_refs.append(li)
@@ -2355,9 +2496,10 @@ def bake_face_texture(human, face_mat, skin_tone, output_png_path,
         offset_v = box_v0 + pack_margin + (box_h - new_h) / 2.0
 
         for li in loop_refs:
-            uv = uv_layer.data[li].uv
-            uv.x = offset_u + (uv.x - u_min) * scale
-            uv.y = offset_v + (uv.y - v_min) * scale
+            src_uv = read_layer.data[li].uv
+            dst_uv = uv_layer.data[li].uv
+            dst_uv.x = offset_u + (src_uv.x - u_min) * scale
+            dst_uv.y = offset_v + (src_uv.y - v_min) * scale
 
         print(f"[INFO] Rescaled '{label}' (material_index={material_index}, "
               f"{len(loop_refs)} loops) from footprint "
@@ -2367,7 +2509,8 @@ def bake_face_texture(human, face_mat, skin_tone, output_png_path,
               f"ran -- if it's missing from the console log, this file did "
               f"not execute for that run.")
 
-    _rescale_material_group_uvs(1, HEAD_UV_BOX, "face/head")
+    _rescale_material_group_uvs(1, HEAD_UV_BOX, "face/head",
+                                 source_uv_layer=mesh.uv_layers["FaceProjection"])
     _rescale_material_group_uvs(0, BODY_UV_BOX, "skin/body")
 
     mesh.uv_layers.active = mesh.uv_layers[bake_uv_name]

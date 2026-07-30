@@ -83,6 +83,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir -r requirements.txt
 COPY extract_face_landmarks.py ./
+RUN curl -L -o /app/selfie_segmenter.tflite \
+    https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite
+COPY remove_background.py ./
 COPY server.py generator_core.py ./
 
 # Bake the CC0 clothing asset packs into the image at build time 

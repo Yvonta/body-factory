@@ -20,6 +20,8 @@ import re
 import shutil
 import uuid
 
+from remove_background import remove_background
+
 # 3. Omgevingsvariabelen
 env = os.environ.copy()
 env["BLENDER_USER_CONFIG"] = "/root/.config/blender"
@@ -47,6 +49,14 @@ env["MESA_GLSL_VERSION_OVERRIDE"] = "430"
 # instant. Both require the avatar to still exist after the original
 # request returns.
 AVATAR_STORAGE_DIR = os.environ.get("AVATAR_STORAGE_DIR", "/data/avatars")
+
+# Path to the MediaPipe Selfie Segmenter model used by remove_background()
+# below. Download once, same directory as this file / generator_core.py:
+#   curl -L -o selfie_segmenter.tflite \
+#     https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite
+SELFIE_SEGMENTER_MODEL_PATH = os.environ.get(
+    "SELFIE_SEGMENTER_MODEL_PATH", "selfie_segmenter.tflite"
+)
 
 # Both avatar_id (a uuid4 we generate ourselves) and clothes_name (comes
 # from the client) end up as path components below -- restrict both to a
@@ -147,6 +157,27 @@ async def generate_avatar(
         # original file (same behavior as before this fix existed) but
         # make the risk visible in logs rather than failing silently.
         print(f"[WARNING] Could not normalize EXIF orientation for "
+              f"{temp_image_path}: {e}")
+
+    # NEW: replace the photo's background with a neutral fill color, same
+    # place/pattern as the EXIF fix above -- runs once, in-place, before
+    # ANY downstream consumer (landmark extraction or the face-texture
+    # projection in generator_core.py/Blender) sees the file. Without
+    # this, a colorful/busy background can bleed onto the model wherever
+    # the projected face material extends close to the photo's edge (real
+    # bug, confirmed via testing: a vivid background shape ended up
+    # painted directly onto the jaw/ear area of a generated avatar).
+    # Graceful degradation to match the EXIF fix's pattern: never hard-
+    # fail generation over this -- proceed with the original photo (same
+    # background-bleed risk as before this fix existed) but make it
+    # visible in logs rather than failing silently or blocking a request
+    # over what's ultimately a quality improvement, not a correctness
+    # requirement.
+    try:
+        remove_background(temp_image_path, temp_image_path,
+                           model_path=SELFIE_SEGMENTER_MODEL_PATH)
+    except Exception as e:
+        print(f"[WARNING] Could not remove background for "
               f"{temp_image_path}: {e}")
 
     # 1. Stap 1: Genereer landmarks op basis van de geüploade afbeelding
