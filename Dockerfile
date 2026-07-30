@@ -85,7 +85,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 COPY extract_face_landmarks.py ./
 COPY server.py generator_core.py ./
 
-# Bake the CC0 clothing asset packs into the image at build time
+# Bake the CC0 clothing asset packs into the image at build time 
 RUN mkdir -p /opt/mpfb-assets/clothes
 COPY mpfb-assets/clothes/ /opt/mpfb-assets/clothes/
 # (or download+unzip the asset pack zips here instead of COPY, if you'd
