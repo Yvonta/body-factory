@@ -4,3 +4,4 @@ pydantic==2.7.4
 mediapipe
 opencv-python
 scikit-image
+pygltflib
