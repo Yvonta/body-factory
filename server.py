@@ -23,6 +23,30 @@ import uuid
 from remove_background import remove_background
 
 # 3. Omgevingsvariabelen
+# NEW: absolute path to generator_core.py, computed relative to THIS
+# file's own location rather than relying on the subprocess's current
+# working directory at runtime. The three Blender invocations below
+# previously used a bare relative "generator_core.py" -- which Blender
+# resolves relative to whatever CWD server.py's own process happens to
+# have when it runs, NOT necessarily this file's directory. If those
+# differ for any reason (how uvicorn/the container entrypoint starts
+# this process), Blender could silently load a completely different,
+# stale copy of the file with none of this session's changes, while
+# every check of "/app/generator_core.py" (or wherever this file lives)
+# kept showing the correct, up-to-date content -- exactly matching a
+# real, repeated symptom: verified fixes deployed correctly, yet zero
+# observable change in behavior across multiple rounds of edits.
+GENERATOR_CORE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "generator_core.py"
+)
+if os.path.exists(GENERATOR_CORE_PATH):
+    import time
+    mtime = time.ctime(os.path.getmtime(GENERATOR_CORE_PATH))
+    print(f"[STARTUP] Blender will run: {GENERATOR_CORE_PATH} "
+          f"(last modified: {mtime})")
+else:
+    print(f"[STARTUP] WARNING: {GENERATOR_CORE_PATH} does not exist!")
+
 env = os.environ.copy()
 env["BLENDER_USER_CONFIG"] = "/root/.config/blender"
 # NOTE: this points at a Blender 5.1 extensions path. Local testing during
@@ -38,6 +62,21 @@ env["PYTHONPATH"] = "/root/.config/blender/5.1/extensions/user_default"
 env["DISPLAY"] = ":0"
 env["MESA_GL_VERSION_OVERRIDE"] = "4.3"
 env["MESA_GLSL_VERSION_OVERRIDE"] = "430"
+# NEW: force unbuffered stdout/stderr for the Blender subprocess. When
+# stdout is a PIPE (as below, stdout=subprocess.PIPE) rather than a real
+# terminal, Python switches to BLOCK buffering by default -- output only
+# gets physically written out when the buffer fills or the process exits
+# NORMALLY. If Blender crashes abnormally partway through (which real
+# testing strongly suggested is happening -- prints stop appearing with
+# no warning/traceback, right after arbitrary points in execution),
+# whatever was sitting in that buffer but not yet flushed is lost
+# forever, even though it was genuinely printed. This makes every
+# "the log stops right after X" diagnosis unreliable, regardless of
+# where the real crash is -- the log always just shows the last flushed
+# chunk, not necessarily the last thing that actually ran.
+# PYTHONUNBUFFERED=1 makes every print appear immediately, so the log
+# finally reflects what actually executed.
+env["PYTHONUNBUFFERED"] = "1"
 
 # NEW: persistent per-avatar storage. Previously every generated avatar
 # lived only in /tmp and was deleted right after being streamed back
@@ -244,7 +283,7 @@ async def generate_avatar(
     cmd = [
         "/opt/blender/blender",
         "-b",
-        "-P", "generator_core.py",
+        "-P", GENERATOR_CORE_PATH,
         "--",
         "human_base_meshes_bundle.blend",  # ignored when --mpfb-live is set
         temp_image_path,
@@ -371,7 +410,7 @@ async def get_avatar_clothing(avatar_id: str, clothes_name: str):
     cmd = [
         "/opt/blender/blender",
         "-b",
-        "-P", "generator_core.py",
+        "-P", GENERATOR_CORE_PATH,
         "--",
         "human_base_meshes_bundle.blend",  # ignored in --clothing-fit mode
         "/dev/null",                       # image path -- ignored, no photo needed
@@ -411,5 +450,92 @@ async def get_avatar_clothing(avatar_id: str, clothes_name: str):
     return FileResponse(
         path=cache_path,
         filename=f"{avatar_id}_{clothes_name}.glb",
+        media_type="model/gltf-binary",
+    )
+
+
+@app.get("/v1/avatar/{avatar_id}/hair/{hair_name}")
+async def get_avatar_hair(avatar_id: str, hair_name: str):
+    """On-demand, cached hair fitting. Mirrors get_avatar_clothing() above
+    exactly -- hair turned out to use the identical .mhclo asset
+    mechanism as clothing (confirmed via a real directory listing of the
+    installed hair assets), just resolved from generator_core.py's
+    --hair-fit flag / 'hair' asset subdir instead of --clothing-fit /
+    'clothes'. Same caching behavior: first request for a given
+    (avatar_id, hair_name) pair costs a real Blender run; every request
+    after that is served straight from disk.
+    """
+    avatar_id = _require_safe_slug(avatar_id, "avatar_id")
+    hair_name = _require_safe_slug(hair_name, "hair_name")
+
+    avatar_dir = os.path.join(AVATAR_STORAGE_DIR, avatar_id)
+    macros_path = os.path.join(avatar_dir, "macros.json")
+    if not os.path.exists(macros_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No avatar found with id '{avatar_id}' (or it has no "
+                   f"saved macros -- was it generated before this endpoint "
+                   f"existed?)."
+        )
+
+    hair_dir = os.path.join(avatar_dir, "hair")
+    os.makedirs(hair_dir, exist_ok=True)
+    cache_path = os.path.join(hair_dir, f"{hair_name}.glb")
+
+    # --- Fast path: already fitted for this avatar, no Blender needed ---
+    if os.path.exists(cache_path):
+        return FileResponse(
+            path=cache_path,
+            filename=f"{avatar_id}_{hair_name}.glb",
+            media_type="model/gltf-binary",
+        )
+
+    # --- Slow path: fit it now, then cache for every request after this ---
+    with open(macros_path) as f:
+        macros = json.load(f)
+
+    cmd = [
+        "/opt/blender/blender",
+        "-b",
+        "-P", GENERATOR_CORE_PATH,
+        "--",
+        "human_base_meshes_bundle.blend",  # ignored in --hair-fit mode
+        "/dev/null",                       # image path -- ignored, no photo needed
+        cache_path,
+        json.dumps(macros),
+        "--hair-fit", hair_name,
+    ]
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env
+    )
+
+    print(f"### Blender hair-fit output for avatar {avatar_id}, "
+          f"hair '{hair_name}' (returncode={result.returncode}) ###")
+    print(result.stdout)
+    print(f"### end Blender hair-fit output ###")
+
+    if result.returncode != 0:
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Blender crash while fitting hair! Logs: {result.stdout}"
+        )
+
+    if not os.path.exists(cache_path):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Blender finished but no hair file found at "
+                   f"{cache_path}. Logs: {result.stdout}"
+        )
+
+    return FileResponse(
+        path=cache_path,
+        filename=f"{avatar_id}_{hair_name}.glb",
         media_type="model/gltf-binary",
     )

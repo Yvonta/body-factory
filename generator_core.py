@@ -11,7 +11,7 @@ def parse_args():
               "<image_path> <output_path> [--object realistic_body_male] "
               "[--landmarks path.json] [--face-bias 0.35] "
               "[--face-scale-margin 0.75] [--debug-mask] [--skip-head-warp] "
-              "[--mpfb-live] [--clothing-fit ASSET_NAME]\n"
+              "[--mpfb-live] [--clothing-fit ASSET_NAME] [--hair-fit ASSET_NAME]\n"
               "  --landmarks: also auto-detects eye/nose/mouth position and "
               "scale for the face texture projection (not just head shape). "
               "Without it, --face-bias is used as a fallback heuristic.\n"
@@ -28,7 +28,11 @@ def parse_args():
               "the named MPFB2 clothes asset to it, and exports ONLY the "
               "clothing mesh -- bound to that same skeleton/bind pose -- to "
               "<output>. <image_path>/<landmarks>/face options are ignored "
-              "in this mode. Implies --mpfb-live.")
+              "in this mode. Implies --mpfb-live.\n"
+              "  --hair-fit ASSET_NAME: same as --clothing-fit, but for a "
+              "named MPFB2 hair asset (identical .mhclo mechanism, "
+              "resolved from the 'hair' asset subdir instead of "
+              "'clothes').")
         sys.exit(1)
 
     idx = sys.argv.index("--")
@@ -50,6 +54,7 @@ def parse_args():
         "skin_tone_adjust": 0,
         "mpfb_live": False,
         "clothing_fit": None,
+        "hair_fit": None,
     }
 
     rest = argv[3:]
@@ -132,6 +137,11 @@ def parse_args():
             # Clothing-fit mode always rebuilds the body live via MPFB2 (the
             # only path that gives us the human + skeleton to fit against) --
             # never through the static-donor-mesh path.
+            args["mpfb_live"] = True
+            i += 2
+        elif rest[i] == "--hair-fit":
+            args["hair_fit"] = rest[i + 1]
+            # Same reasoning as --clothing-fit above.
             args["mpfb_live"] = True
             i += 2
         else:
@@ -628,13 +638,26 @@ def generate_mpfb_human(gender_value, age, weight, standard_rig="cmu_mb",
     return basemesh
 
 
-def _bbox_height(obj):
-    """World-space bounding-box height (Z extent) of an object, accounting
-    for its current transform -- used to sanity-check clothing scale."""
+def _bbox_max_dimension(obj):
+    """World-space bounding-box max extent across X/Y/Z (accounting for
+    the object's current transform) -- used to sanity-check asset scale.
+
+    CHANGED from height-only (Z extent alone): a real test showed hair
+    coming out dramatically oversized in WIDTH (spreading far past the
+    shoulders) while its HEIGHT relative to the body wasn't necessarily
+    extreme enough to trigger the old height-only ratio check. Garments
+    are typically taller-than-wide so height-only mostly worked for
+    those, but that's not a safe assumption for hair, which can be much
+    wider/deeper than tall (a wide/voluminous style) without being
+    miscalibrated at all -- checking the max of all three axes catches
+    oversizing regardless of which dimension it shows up in.
+    """
     bpy.context.view_layer.update()
     corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    xs = [c.x for c in corners]
+    ys = [c.y for c in corners]
     zs = [c.z for c in corners]
-    return max(zs) - min(zs)
+    return max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
 
 
 def _sanity_check_and_correct_scale(clothes, human):
@@ -647,17 +670,18 @@ def _sanity_check_and_correct_scale(clothes, human):
     itself succeeded without error.
 
     This is a heuristic safety net, not a proper fix for the underlying
-    asset data: if a single garment's bounding-box height comes out
-    wildly disproportionate to the whole body's height, apply a rough
-    corrective uniform scale. A well-calibrated garment covering part of
-    the body should never come close to matching or exceeding the full
-    body's own height -- if it does, something upstream (this asset's
-    calibration) is already wrong, and this only makes the result usable
-    rather than obviously broken.
+    asset data: if a single asset's bounding-box size comes out wildly
+    disproportionate to the whole body's own size (in ANY dimension, not
+    just height -- see _bbox_max_dimension), apply a rough corrective
+    uniform scale. A well-calibrated asset covering part of the body
+    should never come close to matching or exceeding the full body's own
+    size -- if it does, something upstream (this asset's calibration) is
+    already wrong, and this only makes the result usable rather than
+    obviously broken.
     """
     try:
-        human_h = _bbox_height(human)
-        clothes_h = _bbox_height(clothes)
+        human_h = _bbox_max_dimension(human)
+        clothes_h = _bbox_max_dimension(clothes)
     except Exception as e:
         print(f"[WARNING] Could not compute bounding boxes for scale "
               f"sanity check: {e}")
@@ -673,7 +697,7 @@ def _sanity_check_and_correct_scale(clothes, human):
         # fit), since this is patching over bad source data, not
         # recomputing the fit properly.
         correction = (1.0 / ratio) * 0.9
-        print(f"[WARNING] Clothes bounding-box height ({clothes_h:.3f}) is "
+        print(f"[WARNING] Asset bounding-box max dimension ({clothes_h:.3f}) is "
               f"wildly mismatched vs human ({human_h:.3f}), ratio={ratio:.2f} "
               f"-- this asset's .mhclo is likely missing proper scale "
               f"calibration. Applying corrective uniform scale ×{correction:.3f} "
@@ -704,10 +728,20 @@ def _sanity_check_and_correct_scale(clothes, human):
               f"reasonable -- no scale correction applied.")
 
 
-def _fit_clothes_to_human(mpfb_module, human, clothes_name):
-    """Load and fit an MPFB2 clothes asset onto `human`, binding it to the
-    same armature `human` is already rigged with (via add_builtin_rig in
-    generate_mpfb_human()).
+def _fit_mhclo_asset_to_human(mpfb_module, human, asset_name, asset_subdir="clothes", asset_label="clothes"):
+    """Load and fit an MPFB2 .mhclo asset (clothing OR hair -- both use the
+    exact same proxy-mesh mechanism in MakeHuman/MPFB2) onto `human`,
+    binding it to the same armature `human` is already rigged with (via
+    add_builtin_rig in generate_mpfb_human()).
+
+    GENERALIZED from _fit_clothes_to_human() (2026-07-30): confirmed via
+    real directory listing that the user's hair assets use the identical
+    .mhclo + .obj + .mhmat format and the same third-party asset-pack
+    naming conventions as the clothing assets -- not MPFB2's separate
+    built-in hair-curves/cards system (a different investigation path
+    that turned out not to apply here). asset_subdir/asset_label let the
+    same logic serve both "clothes" and "hair" (or any other .mhclo asset
+    category AssetService knows about) without duplicating this.
 
     CONFIRMED (real source read, 2026-07-27, from both assetservice.py AND
     the actual MPFB2 UI operator that does this in the Blender interface --
@@ -726,42 +760,42 @@ def _fit_clothes_to_human(mpfb_module, human, clothes_name):
     # AssetService.find_asset_absolute_path(asset_path_fragment, asset_subdir="clothes")
     # does an EXACT FILENAME match against files on disk (`if filename in files`) --
     # it does NOT append an extension for you.
-    mhclo_filename = f"{clothes_name}.mhclo"
-    clothes_path = None
+    mhclo_filename = f"{asset_name}.mhclo"
+    asset_path = None
     try:
-        clothes_path = AssetService.find_asset_absolute_path(mhclo_filename, "clothes")
-        if clothes_path:
-            print(f"[INFO] Resolved clothes asset '{clothes_name}' -> "
-                  f"{clothes_path} (via AssetService.find_asset_absolute_path)")
+        asset_path = AssetService.find_asset_absolute_path(mhclo_filename, asset_subdir)
+        if asset_path:
+            print(f"[INFO] Resolved {asset_label} asset '{asset_name}' -> "
+                  f"{asset_path} (via AssetService.find_asset_absolute_path)")
     except Exception as e:
         print(f"[WARNING] AssetService.find_asset_absolute_path('{mhclo_filename}', "
-              f"'clothes') failed: {e}")
+              f"'{asset_subdir}') failed: {e}")
 
-    if not clothes_path:
-        print(f"[ERROR] Could not resolve a file path for clothes asset "
-              f"'{clothes_name}' (looked for filename '{mhclo_filename}' "
-              f"under the 'clothes' asset subdir).")
+    if not asset_path:
+        print(f"[ERROR] Could not resolve a file path for {asset_label} asset "
+              f"'{asset_name}' (looked for filename '{mhclo_filename}' "
+              f"under the '{asset_subdir}' asset subdir).")
         return None
 
     Mhclo = importlib.import_module(f"{mpfb_module}.entities.clothes.mhclo").Mhclo
     ClothesService = importlib.import_module(f"{mpfb_module}.services.clothesservice").ClothesService
 
     # --- Step 1: parse the .mhclo file and import the mesh it references.
-    # THIS is the real "clothes" Object -- not the file path itself. ---
+    # THIS is the real asset Object -- not the file path itself. ---
     try:
         mhclo = Mhclo()
-        mhclo.load(clothes_path)
-        clothes = mhclo.load_mesh(bpy.context)
+        mhclo.load(asset_path)
+        asset_obj = mhclo.load_mesh(bpy.context)
     except Exception as e:
-        print(f"[ERROR] Mhclo().load('{clothes_path}') / load_mesh() failed: {e}")
+        print(f"[ERROR] Mhclo().load('{asset_path}') / load_mesh() failed: {e}")
         return None
 
-    if not clothes:
+    if not asset_obj:
         print(f"[ERROR] mhclo.load_mesh() returned no object for "
-              f"'{clothes_path}' -- failed to import the clothes mesh.")
+              f"'{asset_path}' -- failed to import the {asset_label} mesh.")
         return None
-    print(f"[INFO] Imported clothes mesh object '{clothes.name}' from "
-          f"'{clothes_path}'.")
+    print(f"[INFO] Imported {asset_label} mesh object '{asset_obj.name}' from "
+          f"'{asset_path}'.")
 
     # --- Step 1.5: build a REAL textured material, matching the actual
     # MPFB2 load-clothes operator's MAKESKIN branch (confirmed via direct
@@ -775,34 +809,140 @@ def _fit_clothes_to_human(mpfb_module, human, clothes_name):
             makeskin_material = MakeSkinMaterial()
             makeskin_material.populate_from_mhmat(mhclo.material)
             mat_name = os.path.basename(mhclo.material)
-            blender_material = MaterialService.create_empty_material(mat_name, clothes)
+            blender_material = MaterialService.create_empty_material(mat_name, asset_obj)
             makeskin_material.apply_node_tree(blender_material)
             print(f"[INFO] Built real textured material '{mat_name}' for "
-                  f"'{clothes.name}' via MakeSkinMaterial.populate_from_mhmat() "
+                  f"'{asset_obj.name}' via MakeSkinMaterial.populate_from_mhmat() "
                   f"+ apply_node_tree() (from mhclo.material='{mhclo.material}').")
         except Exception as e:
             print(f"[WARNING] Building the real MakeSkin material failed "
                   f"(continuing with whatever material load_mesh() left in "
                   f"place -- likely untextured): {e}")
     else:
-        print(f"[WARNING] mhclo.material is empty for '{clothes.name}' -- "
+        print(f"[WARNING] mhclo.material is empty for '{asset_obj.name}' -- "
               f"this .mhclo doesn't reference a .mhmat material file, so "
               f"there's no texture to build regardless of the code above.")
 
     # --- Step 2: fit it to this specific human's shape (position/scale to
     # match the body's macrodetail values -- NOT bone weights yet). ---
     try:
-        ClothesService.fit_clothes_to_human(clothes, human, mhclo)
+        ClothesService.fit_clothes_to_human(asset_obj, human, mhclo)
         mhclo.set_scalings(bpy.context, human)
-        print(f"[INFO] Fitted '{clothes.name}' to human via "
+        print(f"[INFO] Fitted '{asset_obj.name}' to human via "
               f"ClothesService.fit_clothes_to_human() + mhclo.set_scalings().")
     except Exception as e:
         print(f"[WARNING] Fitting step failed (continuing anyway -- "
-              f"clothes may be mispositioned): {e}")
+              f"{asset_label} may be mispositioned): {e}")
 
-    _sanity_check_and_correct_scale(clothes, human)
+def _sanity_check_and_correct_hair(hair_obj, human):
+    """Hair-specific sanity check: compare against the HUMAN'S HEAD size
+    (estimated as a fraction of total body height -- see CHANGED note
+    below for why this doesn't use detect_neck_z()), not the whole body.
 
-    # --- Step 3: find the human's armature, and bind the garment to it
+    Real test evidence for why this needed its own function rather than
+    reusing _sanity_check_and_correct_scale(): a real hair asset passed
+    the whole-body max-dimension check (ratio ~0.9 -- looks "normal")
+    while its own vertical span was measured at ~6x the real head height,
+    positioned centered on the torso rather than the head. Unlike
+    clothing (legitimately body-scale, so a whole-body comparison makes
+    sense), hair should be head-scale -- almost anything human-sized
+    passes a whole-body check, so it can't catch this class of error at
+    all for hair specifically.
+
+    CHANGED: originally used detect_neck_z() for a precise head
+    measurement (like the rest of this pipeline does), but real testing
+    showed a silent crash specifically when it's called on THIS mesh --
+    the pristine, hair/genitals-INCLUDED reference body used only for
+    clothing/hair fitting (remove_hair_genitals=False). Every other
+    caller of detect_neck_z() in this pipeline runs it on the mesh AFTER
+    hair/genital removal; this was the first time it ran on the raw,
+    unstripped mesh, now scanning through thousands of extra hair-strand
+    vertices around the scalp its cross-sectional algorithm has never
+    encountered before. The crash survived being wrapped in try/except
+    with traceback.print_exc() (no exception, no traceback, just
+    silence) -- strong evidence it's a low-level/native crash, not a
+    catchable Python exception, so avoiding the call entirely is safer
+    than trying to catch it. Uses the simple body-height-fraction
+    estimate (already proven safe elsewhere in this same function as the
+    fallback) unconditionally instead.
+    """
+    mesh = human.data
+    all_zs = [v.co.z for v in mesh.vertices]
+    total_height = max(all_zs) - min(all_zs)
+    head_height = total_height * 0.13
+    head_top_z = max(all_zs)
+    print(f"[INFO] Using a 13%-of-body-height estimate for head size "
+          f"(not detect_neck_z() -- see comment above for why): "
+          f"{head_height:.4f}")
+
+    if head_height <= 0:
+        print("[WARNING] Computed non-positive head height -- skipping "
+              "hair-specific size/position correction.")
+        return
+
+    hair_dim = _bbox_max_dimension(hair_obj)
+    ratio = hair_dim / head_height
+
+    MAX_REASONABLE_RATIO = 3.5  # long/voluminous hair can legitimately be a few head-heights
+    if ratio > MAX_REASONABLE_RATIO:
+        correction = (MAX_REASONABLE_RATIO / ratio) * 0.95
+        print(f"[WARNING] Hair max dimension ({hair_dim:.4f}) is "
+              f"{ratio:.1f}x the real detected head height "
+              f"({head_height:.4f}) -- wildly oversized relative to the "
+              f"head it's meant to sit on (a whole-body comparison alone "
+              f"would not catch this -- ratio to the WHOLE body can look "
+              f"completely normal). Applying corrective uniform "
+              f"scale x{correction:.3f}.")
+        local_corners = [Vector(c) for c in hair_obj.bound_box]
+        center = sum(local_corners, Vector((0.0, 0.0, 0.0))) / len(local_corners)
+        mesh_data = hair_obj.data
+        for v in mesh_data.vertices:
+            v.co = center + (v.co - center) * correction
+        mesh_data.update()
+        bpy.context.view_layer.update()
+
+    # Recompute after any scale correction, then recenter vertically so
+    # the hair's own top lands near the head's actual top (small margin
+    # for volume/roots sitting slightly above the scalp).
+    bpy.context.view_layer.update()
+    world_corners = [hair_obj.matrix_world @ Vector(c) for c in hair_obj.bound_box]
+    hair_top_z = max(c.z for c in world_corners)
+    target_top_z = head_top_z + head_height * 0.1
+    z_offset = target_top_z - hair_top_z
+    if abs(z_offset) > 0.001:
+        print(f"[INFO] Recentering hair vertically: current top="
+              f"{hair_top_z:.4f}, target top={target_top_z:.4f} (real "
+              f"head top={head_top_z:.4f} + 10% margin) -- shifting by "
+              f"{z_offset:+.4f}.")
+        mesh_data = hair_obj.data
+        for v in mesh_data.vertices:
+            v.co.z += z_offset
+        mesh_data.update()
+        bpy.context.view_layer.update()
+
+
+    # RE-ENABLED: was temporarily disabled to isolate whether this code
+    # was the crash source. Real testing then revealed the Blender
+    # subprocess's stdout was BLOCK BUFFERED (stdout=subprocess.PIPE in
+    # server.py switches Python off line-buffering), so any crash could
+    # silently swallow output that genuinely printed but hadn't been
+    # flushed yet -- meaning every earlier "the log stops right after X"
+    # diagnosis was unreliable regardless of what actually ran. Fixed at
+    # the source (server.py now sets PYTHONUNBUFFERED=1 for this
+    # subprocess) rather than continuing to guess blind here.
+    import traceback
+    try:
+        if asset_label == "hair":
+            _sanity_check_and_correct_hair(asset_obj, human)
+        else:
+            _sanity_check_and_correct_scale(asset_obj, human)
+    except Exception as e:
+        print(f"[WARNING] Size/position sanity check failed (continuing "
+              f"anyway with the uncorrected {asset_label} -- it may be "
+              f"wrongly sized or positioned): {e}")
+        traceback.print_exc()
+
+    # --- Step 3: find the human's armature, and bind the asset to it
     # (bone weights) via ClothesService.set_up_rigging() -- this is what
     # makes it actually deform with the body's animation, distinct from
     # just being positioned correctly at rest. ---
@@ -814,53 +954,78 @@ def _fit_clothes_to_human(mpfb_module, human, clothes_name):
 
     if armature is not None:
         try:
-            clothes.location = (0.0, 0.0, 0.0)
+            asset_obj.location = (0.0, 0.0, 0.0)
             ClothesService.set_up_rigging(
-                human, clothes, armature, mhclo,
+                human, asset_obj, armature, mhclo,
                 interpolate_weights=True, import_subrig=False, import_weights=True)
-            print(f"[INFO] Rigged '{clothes.name}' to armature "
+            print(f"[INFO] Rigged '{asset_obj.name}' to armature "
                   f"'{armature.name}' via ClothesService.set_up_rigging().")
         except Exception as e:
             print(f"[WARNING] ClothesService.set_up_rigging(...) failed: "
-                  f"{e} -- clothes will be parented but NOT bone-weighted "
-                  f"(won't deform with animation). Falling back to simple "
-                  f"parenting.")
-            clothes.parent = human
+                  f"{e} -- {asset_label} will be parented but NOT "
+                  f"bone-weighted (won't deform with animation). Falling "
+                  f"back to simple parenting.")
+            asset_obj.parent = human
     else:
-        print("[WARNING] No armature found on human -- parenting clothes "
-              "without bone weights (won't deform with animation).")
-        clothes.parent = human
+        print(f"[WARNING] No armature found on human -- parenting "
+              f"{asset_label} without bone weights (won't deform with "
+              f"animation).")
+        asset_obj.parent = human
 
-    return clothes
+    return asset_obj
 
 
-def run_clothing_fit(args):
-    """Handle --clothing-fit: rebuild a body from the given gender/age/
-    weight (identical to how the matching avatar's own body was built,
-    since generate_mpfb_human() is deterministic for the same inputs and
-    fixed rig_option order), fit the requested clothing asset to it, and
-    export ONLY the clothing mesh -- skinned to that same armature/bind
-    pose -- to args["output"]. The face/photo/landmarks pipeline is not
-    involved at all in this mode.
+def _fit_clothes_to_human(mpfb_module, human, clothes_name):
+    """Thin wrapper over _fit_mhclo_asset_to_human() for clothing --
+    unchanged behavior, kept as its own name since it's referenced
+    elsewhere by this name."""
+    return _fit_mhclo_asset_to_human(mpfb_module, human, clothes_name,
+                                      asset_subdir="clothes", asset_label="clothes")
+
+
+def _fit_hair_to_human(mpfb_module, human, hair_name):
+    """Thin wrapper over _fit_mhclo_asset_to_human() for hair -- same
+    .mhclo mechanism as clothing, just resolved from the 'hair' asset
+    subdir instead of 'clothes' (confirmed via real directory listing,
+    2026-07-30: /opt/mpfb-assets/hair/<name>/<name>.mhclo, identical
+    structure to the clothes assets)."""
+    return _fit_mhclo_asset_to_human(mpfb_module, human, hair_name,
+                                      asset_subdir="hair", asset_label="hair")
+
+
+def run_asset_fit(args, asset_name, asset_subdir, asset_label):
+    """Handle --clothing-fit or --hair-fit: rebuild a body from the given
+    gender/age/weight (identical to how the matching avatar's own body
+    was built, since generate_mpfb_human() is deterministic for the same
+    inputs and fixed rig_option order), fit the requested asset to it,
+    and export ONLY that asset's mesh -- skinned to that same armature/
+    bind pose -- to args["output"]. The face/photo/landmarks pipeline is
+    not involved at all in this mode.
+
+    GENERALIZED from run_clothing_fit() (2026-07-30) to also serve hair,
+    which turned out to use the identical .mhclo asset mechanism as
+    clothing (confirmed via real directory listing), just resolved from
+    a different asset_subdir.
     """
-    print(f"[INFO] --clothing-fit '{args['clothing_fit']}': building body "
+    print(f"[INFO] --{asset_label}-fit '{asset_name}': building body "
           f"(gender={args['gender_value']:.3f}, age={args['age']:.2f}, "
-          f"weight={args['weight']:.2f}) to fit clothing against...")
+          f"weight={args['weight']:.2f}) to fit {asset_label} against...")
     human = generate_mpfb_human(args["gender_value"], args["age"], args["weight"],
                                  remove_hair_genitals=False)
 
     mpfb_module = _find_mpfb_module_name()
     _configure_mpfb_asset_root(mpfb_module)
-    clothes_obj = _fit_clothes_to_human(mpfb_module, human, args["clothing_fit"])
+    asset_obj = _fit_mhclo_asset_to_human(mpfb_module, human, asset_name,
+                                           asset_subdir=asset_subdir, asset_label=asset_label)
 
-    if clothes_obj is None:
-        print(f"[ERROR] Could not fit clothing asset "
-              f"'{args['clothing_fit']}' -- see warnings above for which "
+    if asset_obj is None:
+        print(f"[ERROR] Could not fit {asset_label} asset "
+              f"'{asset_name}' -- see warnings above for which "
               f"API candidates were tried.")
         sys.exit(1)
 
     # Find the armature human was rigged with, so it can be exported
-    # alongside the clothing mesh (glTF needs the armature object present
+    # alongside the asset mesh (glTF needs the armature object present
     # to write correct joint/skin data, same reasoning as the main export
     # path's export_apply=False comment below).
     armature = None
@@ -870,15 +1035,15 @@ def run_clothing_fit(args):
             break
 
     if armature is None:
-        print("[WARNING] Could not find the body's armature -- exporting "
-              "the clothing mesh without a skeleton. It will NOT bind to "
-              "an avatar's bones in the viewer.")
+        print(f"[WARNING] Could not find the body's armature -- exporting "
+              f"the {asset_label} mesh without a skeleton. It will NOT "
+              f"bind to an avatar's bones in the viewer.")
 
     bpy.ops.object.select_all(action='DESELECT')
-    clothes_obj.select_set(True)
+    asset_obj.select_set(True)
     if armature is not None:
         armature.select_set(True)
-    bpy.context.view_layer.objects.active = clothes_obj
+    bpy.context.view_layer.objects.active = asset_obj
 
     # Same export_apply=False reasoning as the main avatar export: the
     # Armature modifier must stay un-applied for the exporter to write
@@ -893,7 +1058,20 @@ def run_clothing_fit(args):
         export_morph=True,
         use_selection=True,
     )
-    print(f"[SUCCESS] Exported clothing-only GLB to: {args['output']}")
+    print(f"[SUCCESS] Exported {asset_label}-only GLB to: {args['output']}")
+
+
+def run_clothing_fit(args):
+    """Thin wrapper over run_asset_fit() for clothing -- unchanged
+    behavior, kept as its own name since it's referenced elsewhere by
+    this name."""
+    run_asset_fit(args, args["clothing_fit"], asset_subdir="clothes", asset_label="clothes")
+
+
+def run_hair_fit(args):
+    """Thin wrapper over run_asset_fit() for hair -- same .mhclo
+    mechanism as clothing, resolved from the 'hair' asset subdir."""
+    run_asset_fit(args, args["hair_fit"], asset_subdir="hair", asset_label="hair")
 
 
 def _try_append_armature(donor_path, mesh_object_name):
@@ -2725,6 +2903,11 @@ def main():
         # no landmarks. Exits inside run_clothing_fit() (success) or via
         # sys.exit(1) (fit failed), so nothing below this branch runs.
         run_clothing_fit(args)
+        return
+
+    if args["hair_fit"]:
+        # Same reasoning as clothing_fit above.
+        run_hair_fit(args)
         return
 
     if args["mpfb_live"]:

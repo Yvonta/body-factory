@@ -86,6 +86,22 @@ COPY extract_face_landmarks.py ./
 RUN curl -L -o /app/selfie_segmenter.tflite \
     https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite
 COPY remove_background.py ./
+
+# CACHE-BUSTING: everything above this line (Ubuntu packages, Blender
+# download, MPFB2 + asset pack install, pip dependencies) is expensive
+# and legitimately doesn't change often -- keeping it cached is correct
+# and desired. server.py/generator_core.py, on the other hand, change
+# constantly during active development, and a real build showed Docker's
+# legacy builder reusing a stale cached layer for their COPY step even
+# after the files on disk had genuinely changed (confirmed via a
+# [STARTUP] log line printing the running file's actual modification
+# time, which kept showing an old timestamp after multiple "successful"
+# rebuilds). ARG CACHEBUST, given a fresh value on every build (see
+# run.sh), invalidates Docker's cache from THIS line onward every time --
+# forcing server.py/generator_core.py to always be freshly copied --
+# without paying the cost of redoing everything above it (which
+# --no-cache would do wholesale, and was confirmed to take "ages").
+ARG CACHEBUST=1
 COPY server.py generator_core.py ./
 
 # Bake the CC0 clothing asset packs into the image at build time 
@@ -93,6 +109,7 @@ RUN mkdir -p /opt/mpfb-assets/clothes
 COPY mpfb-assets/clothes/ /opt/mpfb-assets/clothes/
 # (or download+unzip the asset pack zips here instead of COPY, if you'd
 # rather not vendor them in your repo)
-
+RUN mkdir -p /opt/mpfb-assets/hair
+COPY mpfb-assets/hair/ /opt/mpfb-assets/hair/
 EXPOSE 8090
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8090"]
