@@ -76,8 +76,22 @@ RUN MPFB_DATA_DIR=$(find /root/.config/blender -type d -path "*/mpfb/data" | hea
     && curl -L -o /tmp/faceunits01.zip https://files.makehumancommunity.org/functional/faceunits01.zip \
     && unzip -o /tmp/visemes02.zip -d "$MPFB_DATA_DIR/" \
     && unzip -o /tmp/faceunits01.zip -d "$MPFB_DATA_DIR/" \
-    && rm -f /tmp/visemes02.zip /tmp/faceunits01.zip /tmp/mpfb2.zip /tmp/install_mpfb.py \
     && find "$MPFB_DATA_DIR" -iname "viseme_*" | head -5
+
+# double in diffrent dir
+RUN echo "[INFO] Found MPFB data directory: $MPFB_DATA_DIR" \
+    && mkdir -p "$MPFB_DATA_DIR/targets" \
+    && unzip -o /tmp/visemes02.zip -d "$MPFB_DATA_DIR/targets/" \
+    && unzip -o /tmp/faceunits01.zip -d "$MPFB_DATA_DIR/targets/" 
+
+# Ensure visemes are present in the asset root targets directory
+RUN mkdir -p /opt/mpfb-assets/targets/visemes \
+    && curl -L -o /tmp/visemes02.zip https://files.makehumancommunity.org/functional/visemes02.zip \
+    && unzip -o /tmp/visemes02.zip -d /opt/mpfb-assets/targets/visemes/ \
+    && rm -f /tmp/visemes02.zip /tmp/faceunits01.zip /tmp/mpfb2.zip /tmp/install_mpfb.py \
+    && find "$MPFB_DATA_DIR/targets" -iname "viseme_*" | head -5
+
+
 # 6. Python application setup
 WORKDIR /app
 COPY requirements.txt ./
@@ -112,5 +126,7 @@ COPY mpfb-assets/clothes/ /opt/mpfb-assets/clothes/
 # rather not vendor them in your repo)
 RUN mkdir -p /opt/mpfb-assets/hair
 COPY mpfb-assets/hair/ /opt/mpfb-assets/hair/
+RUN mkdir -p /opt/mpfb-assets/skins
+COPY mpfb-assets/skins/ /opt/mpfb-assets/skins/
 EXPOSE 8090
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8090"]

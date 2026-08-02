@@ -28,7 +28,7 @@ fi
 echo "=== Step 1: generate avatar ==="
 HEADERS_FILE=$(mktemp)
 curl -sS -D "$HEADERS_FILE" -o avatar.glb \
-    -F "gender=0.0" -F "age=0.0" -F "weight=0.5" \
+    -F "gender=0.0" -F "age=0.4" -F "weight=0.2" \
     -F "file=@${IMAGE_PATH}" \
     "${BASE_URL}/v1/avatar/generate"
 echo "--- response headers ---"

@@ -2,6 +2,8 @@ import bpy
 import sys
 import os
 import importlib
+import gzip
+from pathlib import Path
 from mathutils import Vector
 
 
@@ -11,7 +13,8 @@ def parse_args():
               "<image_path> <output_path> [--object realistic_body_male] "
               "[--landmarks path.json] [--face-bias 0.35] "
               "[--face-scale-margin 0.75] [--debug-mask] [--skip-head-warp] "
-              "[--mpfb-live] [--clothing-fit ASSET_NAME] [--hair-fit ASSET_NAME]")
+              "[--mpfb-live] [--clothing-fit ASSET_NAME] [--hair-fit ASSET_NAME] "
+              "[--skin-fit SKIN_NAME]")
         sys.exit(1)
 
     idx = sys.argv.index("--")
@@ -34,6 +37,7 @@ def parse_args():
         "mpfb_live": False,
         "clothing_fit": None,
         "hair_fit": None,
+        "skin_fit": None,
     }
 
     rest = argv[3:]
@@ -85,6 +89,8 @@ def parse_args():
             args["clothing_fit"] = rest[i + 1]; args["mpfb_live"] = True; i += 2
         elif rest[i] == "--hair-fit":
             args["hair_fit"] = rest[i + 1]; args["mpfb_live"] = True; i += 2
+        elif rest[i] == "--skin-fit":
+            args["skin_fit"] = rest[i + 1]; args["mpfb_live"] = True; i += 2
         else:
             i += 1
 
@@ -207,12 +213,71 @@ def _configure_mpfb_asset_root(mpfb_module):
         return False
 
 
-def generate_mpfb_human(gender_value, age, weight, standard_rig="cmu_mb",
-                         viseme_pack="visemes02", remove_hair_genitals=True):
+def _fit_skin_to_human(mpfb_module, human, skin_rel_path):
+    target_path = skin_rel_path
+    if not target_path.endswith(".mhmat"):
+        target_path += ".mhmat"
+        
+    possible_paths = [
+        os.path.join("/opt/mpfb-assets/skins/skin_texture", target_path),
+        os.path.join("/opt/mpfb-assets/skins", target_path),
+        os.path.join("/opt/mpfb-assets", target_path),
+        target_path if os.path.isabs(target_path) else None
+    ]
+    
+    skin_path = None
+    for p in possible_paths:
+        if p and os.path.isfile(p):
+            skin_path = p
+            break
+            
+    if not skin_path:
+        try:
+            AssetService = importlib.import_module(f"{mpfb_module}.services.assetservice").AssetService
+            skin_path = AssetService.find_asset_absolute_path(target_path, "skins")
+            if not skin_path:
+                skin_path = AssetService.find_asset_absolute_path(target_path, "")
+        except Exception:
+            pass
+
+    if not skin_path or not os.path.isfile(skin_path):
+        print(f"[WARNING] Skin bestand niet gevonden op schijf: {skin_rel_path}")
+        return
+
+    try:
+        MaterialService = importlib.import_module(f"{mpfb_module}.services.materialservice").MaterialService
+        mat_name = os.path.splitext(os.path.basename(skin_path))[0]
+        
+        blender_material = MaterialService.create_v2_skin_material(mat_name, human, mhmat_file=skin_path)
+        
+        if blender_material:
+            human.data.materials.clear()
+            human.data.materials.append(blender_material)
+            for i in range(len(human.material_slots)):
+                human.material_slots[i].material = blender_material
+                
+        bpy.context.view_layer.update()
+        print(f"[INFO] MPFB skin materiaal succesvol geforceerd toegewezen aan mesh: {skin_path}")
+    except Exception as e:
+        print(f"[WARNING] Fout bij toepassen van skin {skin_rel_path}: {e}")
+
+
+def generate_mpfb_human(gender_value, age, weight, standard_rig="cmu_mb", remove_hair_genitals=True, custom_skin=None):
     mpfb_module = _find_mpfb_module_name()
+    _configure_mpfb_asset_root(mpfb_module)
+    
+    try:
+        addon_prefs = bpy.context.preferences.addons[mpfb_module].preferences
+        import glob
+        matches = glob.glob("/root/.config/blender/*/extensions/user_default/mpfb")
+        if not matches:
+            matches = glob.glob("/root/.config/blender/*/scripts/addons/mpfb")
+        if matches:
+            setattr(addon_prefs, "mh_user_data", matches[0])
+    except Exception as pref_err:
+        print(f"[WARNING] Could not set mh_user_data programmatically: {pref_err}")
+
     HumanService = importlib.import_module(f"{mpfb_module}.services.humanservice").HumanService
-    TargetService = importlib.import_module(f"{mpfb_module}.services.targetservice").TargetService
-    AssetService = importlib.import_module(f"{mpfb_module}.services.assetservice").AssetService
 
     basemesh = HumanService.create_human()
     try:
@@ -228,7 +293,9 @@ def generate_mpfb_human(gender_value, age, weight, standard_rig="cmu_mb",
         except Exception:
             pass
 
+    TargetService = importlib.import_module(f"{mpfb_module}.services.targetservice").TargetService
     TargetService.reapply_macro_details(basemesh)
+
     dummy_op = _DummyOperator()
     for rig_option in [standard_rig, "default", "default_no_toes", "game_engine"]:
         try:
@@ -239,6 +306,60 @@ def generate_mpfb_human(gender_value, age, weight, standard_rig="cmu_mb",
 
     if remove_hair_genitals:
         basemesh = _remove_clothes_and_hair(mpfb_module, basemesh)
+
+    if not basemesh.data.shape_keys:
+        basemesh.shape_key_add(name="Basis", from_mix=False)
+
+    # --- Direct Path Viseme Shape Key Injection ---
+    VISEME_NAMES = [
+        'viseme_sil', 'viseme_PP', 'viseme_FF', 'viseme_TH', 'viseme_DD',
+        'viseme_kk', 'viseme_CH', 'viseme_SS', 'viseme_nn', 'viseme_RR',
+        'viseme_aa', 'viseme_E', 'viseme_I', 'viseme_O', 'viseme_U'
+    ]
+
+    loaded_visemes = 0
+    visemes_dir = Path("/opt/mpfb-assets/targets/visemes")
+
+    for v_name in VISEME_NAMES:
+        for target_filename in [f"{v_name}.target", f"{v_name.lower()}.target", f"{v_name}.target.gz", f"{v_name.lower()}.target.gz"]:
+            target_path = visemes_dir / target_filename
+            if not target_path.is_file():
+                found_files = list(visemes_dir.rglob(target_filename))
+                if found_files:
+                    target_path = found_files[0]
+
+            if target_path.is_file():
+                if v_name not in basemesh.data.shape_keys.key_blocks:
+                    sk = basemesh.shape_key_add(name=v_name, from_mix=False)
+                    sk.value = 0.0
+                    try:
+                        open_func = gzip.open if str(target_path).endswith(".gz") else open
+                        with open_func(target_path, "rt", encoding="utf-8", errors="ignore") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line or line.startswith("#"):
+                                    continue
+                                parts = line.split()
+                                if len(parts) >= 4:
+                                    try:
+                                        v_idx = int(parts[0])
+                                        dx, dy, dz = float(parts[1]), float(parts[2]), float(parts[3])
+                                        if v_idx < len(basemesh.data.vertices):
+                                            sk.data[v_idx].co.x += dx
+                                            sk.data[v_idx].co.y += dy
+                                            sk.data[v_idx].co.z += dz
+                                    except ValueError:
+                                        continue
+                        loaded_visemes += 1
+                        break
+                    except Exception as ex:
+                        print(f"[DEBUG] Error loading viseme {v_name}: {ex}")
+
+    bpy.context.view_layer.update()
+    print(f"[INFO] Successfully injected {loaded_visemes}/15 Oculus visemes.")
+
+    skin_target = custom_skin if custom_skin else "skin_texture"
+    _fit_skin_to_human(mpfb_module, basemesh, skin_target)
 
     basemesh.name = "Human"
     basemesh.data.name = "Human"
@@ -322,7 +443,7 @@ def _fit_mhclo_asset_to_human(mpfb_module, human, asset_name, asset_subdir="clot
 
 
 def run_asset_fit(args, asset_name, asset_subdir, asset_label):
-    human = generate_mpfb_human(args["gender_value"], args["age"], args["weight"], remove_hair_genitals=False)
+    human = generate_mpfb_human(args["gender_value"], args["age"], args["weight"], remove_hair_genitals=False, custom_skin=args["skin_fit"])
     mpfb_module = _find_mpfb_module_name()
     _configure_mpfb_asset_root(mpfb_module)
     asset_obj = _fit_mhclo_asset_to_human(mpfb_module, human, asset_name, asset_subdir=asset_subdir, asset_label=asset_label)
@@ -341,7 +462,26 @@ def run_asset_fit(args, asset_name, asset_subdir, asset_label):
         export_yup=True,
         export_apply=False,
         export_skins=True,
-        export_morph=False,
+        export_morph=True,
+        use_selection=True,
+    )
+
+
+def run_skin_fit(args):
+    human = generate_mpfb_human(args["gender_value"], args["age"], args["weight"], remove_hair_genitals=True, custom_skin=args["skin_fit"])
+
+    bpy.ops.object.select_all(action='DESELECT')
+    human.select_set(True)
+    bpy.context.view_layer.objects.active = human
+
+    bpy.ops.export_scene.gltf(
+        filepath=args["output"],
+        export_format='GLB',
+        export_materials='EXPORT',
+        export_yup=True,
+        export_apply=False,
+        export_skins=True,
+        export_morph=True,
         use_selection=True,
     )
 
@@ -375,10 +515,12 @@ def recenter_mesh_x(human):
 
 def project_face_texture(human, input_image_path, landmarks_path=None, output_path=None):
     mesh = human.data
-    flat_mat = bpy.data.materials.new(name="SkinMaterial")
-    flat_mat.use_nodes = True
-    mesh.materials.clear()
-    mesh.materials.append(flat_mat)
+    if mesh.materials:
+        flat_mat = mesh.materials[0]
+    else:
+        flat_mat = bpy.data.materials.new(name="SkinMaterial")
+        flat_mat.use_nodes = True
+        mesh.materials.append(flat_mat)
     return flat_mat, (0.76, 0.57, 0.47, 1.0)
 
 
@@ -394,10 +536,17 @@ def main():
         run_hair_fit(args)
         return
 
+    if args["skin_fit"]:
+        run_skin_fit(args)
+        return
+
     if args["mpfb_live"]:
-        human = generate_mpfb_human(args["gender_value"], args["age"], args["weight"])
+        human = generate_mpfb_human(args["gender_value"], args["age"], args["weight"], custom_skin=args["skin_fit"])
     else:
         human = append_donor_body(args["donor"], args["object"])
+        mpfb_module = _find_mpfb_module_name()
+        _configure_mpfb_asset_root(mpfb_module)
+        _fit_skin_to_human(mpfb_module, human, args["skin_fit"] if args["skin_fit"] else "skin_texture")
 
     recenter_mesh_x(human)
     project_face_texture(human, args["image"], landmarks_path=args["landmarks"], output_path=args["output"])
